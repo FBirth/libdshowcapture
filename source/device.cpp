@@ -26,6 +26,82 @@
 
 #define ROCKET_WAIT_TIME_MS 5000
 
+#define EGH_1527_PREFER_48000_HZ 1
+
+#if EGH_1527_PREFER_48000_HZ
+void MyFreeMediaType(AM_MEDIA_TYPE& mt)
+{
+	if (mt.cbFormat != 0)
+	{
+		CoTaskMemFree((PVOID)mt.pbFormat);
+		mt.cbFormat = 0;
+		mt.pbFormat = NULL;
+	}
+	if (mt.pUnk != NULL)
+	{
+		// Unecessary because pUnk should not be used, but safest.
+		mt.pUnk->Release();
+		mt.pUnk = NULL;
+	}
+}
+void MyDeleteMediaType(AM_MEDIA_TYPE* pmt)
+{
+	if (pmt != NULL)
+	{
+		MyFreeMediaType(*pmt); // See FreeMediaType for the implementation.
+		CoTaskMemFree(pmt);
+	}
+}
+#ifndef SAFE_DELETE_MEDIATYPE
+#define SAFE_DELETE_MEDIATYPE(_pmt_) { if (NULL != _pmt_) MyDeleteMediaType(_pmt_); _pmt_ = NULL; }
+#endif
+
+
+HRESULT _ConfigurePinAudio(ComPtr<IAMStreamConfig> streamConfig, WAVEFORMATEX* newFormat)
+{
+	WAVEFORMATEX waveFormatEx;
+	int count = 0, size = 0;
+	HRESULT hr = streamConfig->GetNumberOfCapabilities(&count, &size);
+	if (SUCCEEDED(hr))
+	{
+		for (int i = 0; i < count; i++)
+		{
+			// Get format
+			AM_MEDIA_TYPE* mediaType = nullptr;
+			AUDIO_STREAM_CONFIG_CAPS caps = { 0 };
+			HRESULT hrCaps = streamConfig->GetStreamCaps(i, &mediaType, (PBYTE)&caps);
+			if (FAILED(hrCaps))
+				continue;
+
+			// Check format
+			if (mediaType->formattype == FORMAT_WaveFormatEx)
+			{
+				// Set format
+				waveFormatEx = *(WAVEFORMATEX*)mediaType->pbFormat;
+				if (waveFormatEx.nSamplesPerSec == 48000 && waveFormatEx.nChannels==2 && waveFormatEx.nBlockAlign == 4)
+				{
+					hr = streamConfig->SetFormat(mediaType);
+					// Stop on success
+					if (SUCCEEDED(hr))
+					{
+						if (newFormat)
+							*newFormat = waveFormatEx;
+						SAFE_DELETE_MEDIATYPE(mediaType);
+						break;
+					}
+				}
+			}
+
+			// Cleanup
+			SAFE_DELETE_MEDIATYPE(mediaType);
+		}
+	}
+	return hr;
+}
+
+#endif 
+
+
 namespace DShow {
 
 /* device-vendor.cpp API */
@@ -470,6 +546,10 @@ bool HDevice::SetupAudioCapture(IBaseFilter *filter, AudioConfig &config)
 	bool success;
 	HRESULT hr;
 
+#if EGH_1527_PREFER_48000_HZ
+	bool doSetFormat = true;
+#endif
+
 	success = GetFilterPin(filter, MEDIATYPE_Audio, PIN_CATEGORY_CAPTURE,
 			       PINDIR_OUTPUT, &pin);
 	if (!success) {
@@ -490,6 +570,19 @@ bool HDevice::SetupAudioCapture(IBaseFilter *filter, AudioConfig &config)
 				config.channels = wfex->nChannels;
 				config.format = AudioFormat::Wave16bit;
 				config.useDefaultConfig = false;
+
+#if EGH_1527_PREFER_48000_HZ
+			} else if (defaultMT->formattype == FORMAT_WaveFormatEx
+				&& ((WAVEFORMATEX*)defaultMT->pbFormat)->nSamplesPerSec == 44100) {
+				WAVEFORMATEX wfex = { 0 };
+				if (SUCCEEDED(_ConfigurePinAudio(pinConfig, &wfex))) {
+					config.sampleRate = wfex.nSamplesPerSec;
+					config.channels = wfex.nChannels;
+					config.format = AudioFormat::Wave16bit;
+					config.useDefaultConfig = false;
+					doSetFormat = false;
+				}
+#endif
 			} else {
 				audioMediaType = defaultMT;
 			}
@@ -509,7 +602,11 @@ bool HDevice::SetupAudioCapture(IBaseFilter *filter, AudioConfig &config)
 		}
 	}
 
+#if EGH_1527_PREFER_48000_HZ
+	if (!!pinConfig && doSetFormat) {
+#else
 	if (!!pinConfig) {
+#endif
 		hr = pinConfig->SetFormat(audioMediaType);
 
 		if (FAILED(hr) && hr != E_NOTIMPL) {
